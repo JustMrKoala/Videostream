@@ -45,39 +45,190 @@ class VideoHandler(BaseHTTPRequestHandler):
     def _serve_player(self):
         filename = Path(state["video_path"]).name
         mime, _ = mimetypes.guess_type(state["video_path"])
+        mime = mime or "video/mp4"
+        # truncate long names for display
+        display_name = filename if len(filename) <= 40 else filename[:37] + "…"
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>▶ {filename}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0f0f0f">
+<title>{display_name}</title>
 <style>
-  * {{ margin:0; padding:0; box-sizing:border-box }}
-  body {{
-    background:#0a0a0a; color:#e8e8e8;
-    font-family:'Courier New',monospace;
-    display:flex; flex-direction:column;
-    align-items:center; justify-content:center;
-    min-height:100vh; gap:1.5rem; padding:2rem;
-  }}
-  h1 {{ font-size:clamp(1rem,2vw,1.4rem); color:#aaa;
-        letter-spacing:.1em; text-transform:uppercase; text-align:center }}
-  span.name {{ color:#fff; display:block; margin-top:.3rem }}
-  video {{
-    width:100%; max-width:960px; border-radius:4px;
-    box-shadow:0 0 60px rgba(255,255,255,.06);
-    outline:none;
-  }}
-  p.hint {{ font-size:.75rem; color:#555; letter-spacing:.08em }}
+:root {{
+  --bg:     #0f0f0f;
+  --panel:  #181818;
+  --border: #2a2a2a;
+  --lime:   #e0ff4f;
+  --fg:     #e8e8e8;
+  --muted:  #555;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}}
+*, *::before, *::after {{ margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent }}
+html, body {{
+  height:100%; background:var(--bg); color:var(--fg);
+  font-family:'Courier New', Courier, monospace;
+  overscroll-behavior:none;
+}}
+
+/* ── layout shell ── */
+body {{
+  display:flex; flex-direction:column; min-height:100dvh;
+}}
+
+/* ── top bar ── */
+header {{
+  flex-shrink:0;
+  display:flex; align-items:center; justify-content:space-between;
+  padding:14px 18px 12px;
+  border-bottom:1px solid var(--border);
+}}
+.logo {{ color:var(--lime); font-size:.8rem; font-weight:700; letter-spacing:.12em }}
+.fname {{
+  color:var(--muted); font-size:.72rem; letter-spacing:.04em;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  max-width:55vw; text-align:right;
+}}
+
+/* ── video wrapper — fills remaining space ── */
+.stage {{
+  flex:1; display:flex; align-items:center; justify-content:center;
+  background:#000; position:relative; overflow:hidden;
+}}
+video {{
+  width:100%; height:100%;
+  object-fit:contain;
+  /* tell iOS this is inline, not fullscreen-forced */
+  -webkit-playsinline:true;
+}}
+
+/* ── custom overlay controls (shown when native controls are awkward on mobile) ── */
+/* we keep native controls — they're best on mobile — but style the container */
+.stage video::-webkit-media-controls-panel {{
+  background:linear-gradient(transparent 60%, rgba(0,0,0,.7));
+}}
+
+/* ── bottom info bar ── */
+footer {{
+  flex-shrink:0;
+  padding:10px 18px calc(10px + var(--safe-bottom));
+  border-top:1px solid var(--border);
+  background:var(--panel);
+  display:flex; align-items:center; gap:12px;
+}}
+.dot {{
+  width:7px; height:7px; border-radius:50%;
+  background:var(--lime); flex-shrink:0;
+  animation:pulse 2s ease-in-out infinite;
+}}
+@keyframes pulse {{
+  0%,100% {{ opacity:1; transform:scale(1) }}
+  50%      {{ opacity:.4; transform:scale(.75) }}
+}}
+.status {{ font-size:.7rem; color:var(--muted); letter-spacing:.06em; flex:1 }}
+.fullscreen-btn {{
+  background:none; border:1px solid var(--border); color:var(--muted);
+  font-size:.65rem; font-family:inherit; letter-spacing:.08em;
+  padding:5px 10px; border-radius:3px; cursor:pointer;
+  transition:color .15s, border-color .15s;
+  -webkit-appearance:none;
+}}
+.fullscreen-btn:active {{ color:var(--lime); border-color:var(--lime) }}
+
+/* ── landscape: hide bars for more screen ── */
+@media (orientation:landscape) and (max-height:500px) {{
+  header, footer {{ display:none }}
+  .stage {{ height:100dvh }}
+}}
 </style>
 </head>
 <body>
-  <h1>streaming<span class="name">{filename}</span></h1>
-  <video controls autoplay>
-    <source src="/video" type="{mime or 'video/mp4'}">
-    Your browser does not support the video tag.
+
+<header>
+  <span class="logo">▶ VIDEOSTREAM</span>
+  <span class="fname" title="{filename}">{display_name}</span>
+</header>
+
+<div class="stage">
+  <video
+    id="v"
+    controls
+    autoplay
+    playsinline
+    webkit-playsinline
+    preload="metadata"
+    x-webkit-airplay="allow"
+  >
+    <source src="/video" type="{mime}">
+    Your browser does not support HTML5 video.
   </video>
-  <p class="hint">served via videostream · closes when the app exits</p>
+</div>
+
+<footer>
+  <span class="dot"></span>
+  <span class="status" id="st">connecting…</span>
+  <button class="fullscreen-btn" id="fsBtn" onclick="toggleFS()">FULLSCREEN</button>
+</footer>
+
+<script>
+const v  = document.getElementById('v');
+const st = document.getElementById('st');
+
+function fmt(s) {{
+  if (!s || !isFinite(s)) return '--:--';
+  const m = Math.floor(s/60), sec = Math.floor(s%60);
+  return m + ':' + String(sec).padStart(2,'0');
+}}
+
+function updateStatus() {{
+  if (v.readyState === 0) {{ st.textContent = 'loading…'; return; }}
+  const cur = fmt(v.currentTime);
+  const dur = fmt(v.duration);
+  st.textContent = v.paused
+    ? 'paused · ' + cur + ' / ' + dur
+    : 'playing · ' + cur + ' / ' + dur;
+}}
+
+v.addEventListener('loadedmetadata', updateStatus);
+v.addEventListener('timeupdate', updateStatus);
+v.addEventListener('pause', updateStatus);
+v.addEventListener('play',  updateStatus);
+v.addEventListener('error', () => {{ st.textContent = 'error loading video'; }});
+v.addEventListener('waiting', () => {{ st.textContent = 'buffering…'; }});
+
+/* fullscreen — works across browsers + iOS fallback */
+function toggleFS() {{
+  const el = document.documentElement;
+  if (document.fullscreenElement || document.webkitFullscreenElement) {{
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  }} else if (v.webkitEnterFullscreen) {{
+    /* iOS Safari — enter native video fullscreen */
+    v.webkitEnterFullscreen();
+  }} else {{
+    (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  }}
+}}
+
+/* hide fullscreen button when already in fullscreen */
+document.addEventListener('fullscreenchange', () => {{
+  document.getElementById('fsBtn').textContent =
+    document.fullscreenElement ? 'EXIT' : 'FULLSCREEN';
+}});
+
+/* double-tap the video to toggle play/pause (feels natural on mobile) */
+let lastTap = 0;
+v.addEventListener('touchend', e => {{
+  const now = Date.now();
+  if (now - lastTap < 300) {{
+    v.paused ? v.play() : v.pause();
+    e.preventDefault();
+  }}
+  lastTap = now;
+}});
+</script>
 </body>
 </html>"""
         body = html.encode()
