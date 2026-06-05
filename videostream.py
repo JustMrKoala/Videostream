@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+VideoStream — select any video file, stream it locally,
+expose it via a Cloudflare Quick Tunnel. No trace left on exit.
+"""
 
 import os
 import sys
@@ -16,7 +21,7 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = 8765
-CHUNK = 1 << 16  # 64 KB chunks for streaming
+CHUNK = 1 << 18  # 256 KB chunks — better for mobile over tunnel
 
 # ── State shared between threads ──────────────────────────────────────────────
 state = {
@@ -32,15 +37,34 @@ class VideoHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # silence server logs
 
-    def do_GET(self):
-        if self.path not in ("/", "/video"):
-            self.send_error(404)
-            return
+    def _clean_path(self):
+        """Strip query strings — iOS Safari appends ?t=... cache-busters."""
+        return self.path.split("?")[0].split("#")[0]
 
-        if self.path == "/":
-            self._serve_player()
+    def do_HEAD(self):
+        """iOS probes with HEAD before streaming — must respond correctly."""
+        p = self._clean_path()
+        if p == "/video" and state["video_path"]:
+            size = os.path.getsize(state["video_path"])
+            mime, _ = mimetypes.guess_type(state["video_path"])
+            mime = mime or "video/mp4"
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
         else:
+            self.send_error(404)
+
+    def do_GET(self):
+        p = self._clean_path()
+        if p == "/":
+            self._serve_player()
+        elif p == "/video":
             self._serve_video()
+        else:
+            self.send_error(404)
 
     def _serve_player(self):
         filename = Path(state["video_path"]).name
@@ -240,53 +264,95 @@ v.addEventListener('touchend', e => {{
 
     def _serve_video(self):
         path = state["video_path"]
+        if not path or not os.path.isfile(path):
+            self.send_error(404)
+            return
+
         size = os.path.getsize(path)
         mime, _ = mimetypes.guess_type(path)
         mime = mime or "video/mp4"
 
-        range_header = self.headers.get("Range")
-        if range_header:
-            # parse "bytes=start-end"
-            byte_range = range_header.strip().replace("bytes=", "")
-            parts = byte_range.split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end   = int(parts[1]) if parts[1] else size - 1
-            end   = min(end, size - 1)
-            length = end - start + 1
+        range_header = self.headers.get("Range", "").strip()
 
+        if range_header:
+            # ── Parse "bytes=start-end" robustly ──────────────────────────
+            # iOS sends "bytes=0-1" on first probe, then "bytes=0-" for full
+            # stream, then random mid-file ranges for seeking.
+            try:
+                byte_spec = range_header.replace("bytes=", "")
+                s_part, e_part = byte_spec.split("-", 1)
+                start = int(s_part) if s_part.strip() else 0
+                # If end is blank ("bytes=0-") serve a large chunk, not the
+                # whole file — avoids sending gigabytes over a slow tunnel.
+                if e_part.strip():
+                    end = min(int(e_part), size - 1)
+                else:
+                    # Cap at 8 MB per request so mobile doesn't stall waiting
+                    # for the entire file before playback begins.
+                    end = min(start + (8 * 1024 * 1024) - 1, size - 1)
+            except ValueError:
+                self.send_error(400, "Bad Range header")
+                return
+
+            if start > end or start >= size:
+                self.send_response(416)  # Range Not Satisfiable
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+
+            length = end - start + 1
             self.send_response(206)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Connection", "keep-alive")
             self.end_headers()
 
-            with open(path, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining:
-                    data = f.read(min(CHUNK, remaining))
-                    if not data:
-                        break
-                    self.wfile.write(data)
-                    remaining -= len(data)
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        data = f.read(min(CHUNK, remaining))
+                        if not data:
+                            break
+                        self.wfile.write(data)
+                        remaining -= len(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client disconnected / seeked away — totally normal
         else:
+            # No Range header — serve whole file (desktop browsers, wget, etc.)
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(size))
             self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Connection", "keep-alive")
             self.end_headers()
-            with open(path, "rb") as f:
-                while True:
-                    data = f.read(CHUNK)
-                    if not data:
-                        break
-                    self.wfile.write(data)
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        data = f.read(CHUNK)
+                        if not data:
+                            break
+                        self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
 
 # ── Server helpers ────────────────────────────────────────────────────────────
+from socketserver import ThreadingMixIn
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in its own thread.
+    iOS Safari fires several range requests simultaneously (HEAD probe,
+    initial bytes fetch, metadata fetch) — they must be served concurrently
+    or the player stalls waiting for each one to finish sequentially."""
+    daemon_threads = True
+    allow_reuse_address = True
+
 def start_server():
-    srv = HTTPServer(("0.0.0.0", PORT), VideoHandler)
+    srv = ThreadedHTTPServer(("0.0.0.0", PORT), VideoHandler)
     state["server"] = srv
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
